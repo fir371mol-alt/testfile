@@ -538,11 +538,12 @@ def evaluate_learner(
     matches: int = 30,
     num_players: int = 5,
     learner_id: int = 0,
+    epsilon: float = 0.0,
 ):
     wins = 0
     total_score = 0
     for _ in range(matches):
-        policies = build_policies_with_learner(num_players, learner, learner_id=learner_id, epsilon=0.0)
+        policies = build_policies_with_learner(num_players, learner, learner_id=learner_id, epsilon=epsilon)
         result = run_match(num_players=num_players, policies=policies, verbose=False)
         limit = 60 // num_players
         if result.players[learner_id].score < limit:
@@ -554,6 +555,27 @@ def evaluate_learner(
         "win_rate": wins / matches if matches else 0.0,
         "avg_score": total_score / matches if matches else 0.0,
     }
+
+
+def play_against_trained_model(
+    model_path: str,
+    num_players: int = 5,
+    learner_id: int = 0,
+    epsilon: float = 0.0,
+    verbose: bool = True,
+):
+    """
+    保存済みモデルを1人分のポリシーとして読み込み、
+    他プレイヤー（ルールベース）と1マッチ対戦する。
+    """
+    learner = QLearningPolicy.load(model_path)
+    policies = build_policies_with_learner(
+        num_players=num_players,
+        learner=learner,
+        learner_id=learner_id,
+        epsilon=epsilon,
+    )
+    return run_match(num_players=num_players, policies=policies, verbose=verbose)
 
 
 # =========================
@@ -861,12 +883,13 @@ def run_match(num_players=5, policies=None, verbose=True):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Texas Showdown AI utility")
-    parser.add_argument("--mode", choices=["play", "train", "eval"], default="play")
+    parser.add_argument("--mode", choices=["play", "train", "eval", "vs-model"], default="play")
     parser.add_argument("--players", type=int, default=5)
     parser.add_argument("--episodes", type=int, default=300)
     parser.add_argument("--matches", type=int, default=30)
     parser.add_argument("--learner-id", type=int, default=0)
     parser.add_argument("--model-path", default="q_policy.json")
+    parser.add_argument("--epsilon", type=float, default=0.0)
     args = parser.parse_args()
 
     if args.mode == "play":
@@ -884,14 +907,24 @@ if __name__ == "__main__":
             matches=args.matches,
             num_players=args.players,
             learner_id=args.learner_id,
+            epsilon=0.0,
         )
         print(f"eval stats: {stats}")
-    else:
+    elif args.mode == "eval":
         learner = QLearningPolicy.load(args.model_path)
         stats = evaluate_learner(
             learner,
             matches=args.matches,
             num_players=args.players,
             learner_id=args.learner_id,
+            epsilon=args.epsilon,
         )
         print(f"eval stats: {stats}")
+    else:
+        play_against_trained_model(
+            model_path=args.model_path,
+            num_players=args.players,
+            learner_id=args.learner_id,
+            epsilon=args.epsilon,
+            verbose=True,
+        )
