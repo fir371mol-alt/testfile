@@ -1,5 +1,9 @@
+import argparse
+import json
 import random
 from collections import defaultdict
+from pathlib import Path
+from typing import Callable, Dict, List, Optional, Tuple
 
 # =========================
 # 定数定義
@@ -234,7 +238,7 @@ class GameEngine:
                     f"hand={self.players[pid].hand}, "
                     f"table={[c for _, c in self.trick.plays]}"
                 )
-            card = policies[pid](engine, pid, legal)
+            card = policy_fn[pid](self, pid, legal)
             self.play_card(pid, card)
 
         return self.resolve_trick()
@@ -269,7 +273,7 @@ def play_trick_verbose(engine, policy_fn, trick_no):
     while len(engine.trick.plays) < engine.num_players:
         pid = engine.current_player
         legal = engine.legal_moves(pid)
-        card = policies[pid](engine, pid, legal)
+        card = policy_fn[pid](engine, pid, legal)
 
         print(f"Player {pid} plays {card}")
         if engine.trick and len(engine.trick.plays) == engine.num_players - 1:
@@ -290,8 +294,266 @@ def play_trick_verbose(engine, policy_fn, trick_no):
     return winner
 
 # =========================
-# 
+# Reinforcement Learning Helper
 # =========================
+
+PolicyFn = Callable[["GameEngine", int, List[Card]], Card]
+
+
+class QLearningPolicy:
+    """
+    簡易Q学習ポリシー。
+    - action: カードvalue(0-74)
+    - state: ラフな特徴量タプル（軽量）
+    """
+
+    def __init__(self):
+        self.q: Dict[Tuple, Dict[int, float]] = defaultdict(lambda: defaultdict(float))
+
+    def state_key(self, engine: "GameEngine", player_id: int) -> Tuple:
+        player = engine.players[player_id]
+        hand_size = len(player.hand)
+
+        # 手札の色枚数（順序固定）
+        color_counts = tuple(
+            sum(1 for c in player.hand if c.color == color)
+            for color in COLOR_RANGES.keys()
+        )
+
+        # 場情報（なければNone）
+        if engine.trick is None or len(engine.trick.plays) == 0:
+            trick_size = 0
+            top_color = "none"
+            top_value = -1
+        else:
+            trick_size = len(engine.trick.plays)
+            last_card = engine.trick.plays[-1][1]
+            top_color = last_card.color
+            top_value = last_card.value
+
+        score_gap = engine.players[player_id].score - min(p.score for p in engine.players)
+
+        return (
+            hand_size,
+            color_counts,
+            trick_size,
+            top_color,
+            top_value,
+            score_gap,
+        )
+
+    def act(self, engine: "GameEngine", player_id: int, legal_moves: List[Card], epsilon: float = 0.0) -> Card:
+        if not legal_moves:
+            raise RuntimeError("No legal moves")
+
+        if random.random() < epsilon:
+            return random.choice(legal_moves)
+
+        state = self.state_key(engine, player_id)
+        # 未知状態はランダムで探索寄りに開始
+        if state not in self.q:
+            return random.choice(legal_moves)
+
+        return max(legal_moves, key=lambda c: self.q[state][c.value])
+
+    def update(
+        self,
+        state: Tuple,
+        action_value: int,
+        reward: float,
+        next_state: Tuple,
+        next_legal_values: List[int],
+        alpha: float,
+        gamma: float,
+        done: bool,
+    ):
+        current = self.q[state][action_value]
+        if done or not next_legal_values:
+            target = reward
+        else:
+            next_best = max(self.q[next_state][a] for a in next_legal_values)
+            target = reward + gamma * next_best
+        self.q[state][action_value] = current + alpha * (target - current)
+
+    def to_dict(self):
+        rows = []
+        for state, actions in self.q.items():
+            hand_size, color_counts, trick_size, top_color, top_value, score_gap = state
+            rows.append(
+                {
+                    "state": {
+                        "hand_size": hand_size,
+                        "color_counts": list(color_counts),
+                        "trick_size": trick_size,
+                        "top_color": top_color,
+                        "top_value": top_value,
+                        "score_gap": score_gap,
+                    },
+                    "actions": {str(a): q for a, q in actions.items()},
+                }
+            )
+        return {"q_table": rows}
+
+    @classmethod
+    def from_dict(cls, data):
+        model = cls()
+        for row in data.get("q_table", []):
+            st = row["state"]
+            state = (
+                int(st["hand_size"]),
+                tuple(int(x) for x in st["color_counts"]),
+                int(st["trick_size"]),
+                st["top_color"],
+                int(st["top_value"]),
+                int(st["score_gap"]),
+            )
+            for a, qv in row["actions"].items():
+                model.q[state][int(a)] = float(qv)
+        return model
+
+    def save(self, path: str):
+        Path(path).write_text(json.dumps(self.to_dict(), ensure_ascii=False))
+
+    @classmethod
+    def load(cls, path: str):
+        data = json.loads(Path(path).read_text())
+        return cls.from_dict(data)
+
+    def as_policy(self, epsilon: float = 0.0) -> PolicyFn:
+        def _policy(engine: "GameEngine", player_id: int, legal_moves: List[Card]) -> Card:
+            return self.act(engine, player_id, legal_moves, epsilon=epsilon)
+
+        return _policy
+
+
+def train_q_policy(
+    episodes: int = 500,
+    num_players: int = 5,
+    learner_id: int = 0,
+    alpha: float = 0.1,
+    gamma: float = 0.98,
+    epsilon_start: float = 0.30,
+    epsilon_end: float = 0.05,
+):
+    """
+    学習対象(learner_id)だけQ学習し、他プレイヤーはルールベースで固定。
+    報酬設計:
+      - トリック獲得 +1
+      - ラウンド終了時の獲得点数を加算
+      - マッチ勝利 +5 / 敗北 -5
+    """
+    learner = QLearningPolicy()
+
+    for ep in range(1, episodes + 1):
+        engine = GameEngine(num_players)
+        epsilon = epsilon_start + (epsilon_end - epsilon_start) * (ep / episodes)
+
+        while not engine.is_match_over():
+            engine.start_new_round()
+
+            while not engine.is_round_over():
+                state = None
+                action_value = None
+
+                if engine.current_player == learner_id:
+                    legal = engine.legal_moves(learner_id)
+                    state = learner.state_key(engine, learner_id)
+                    card = learner.act(engine, learner_id, legal, epsilon=epsilon)
+                    action_value = card.value
+                    engine.play_card(learner_id, card)
+                else:
+                    pid = engine.current_player
+                    legal = engine.legal_moves(pid)
+                    card = rule_based_policy(engine, pid, legal)
+                    engine.play_card(pid, card)
+
+                # トリック終了タイミングで報酬更新
+                if engine.trick is not None and len(engine.trick.plays) == engine.num_players:
+                    winner, _, need_choice = engine.resolve_trick()
+                    if need_choice:
+                        next_leader = choose_leader_rule(engine, winner)
+                        engine.choose_next_leader(winner, next_leader)
+
+                    if state is not None:
+                        reward = 1.0 if winner == learner_id else 0.0
+                        done = engine.is_round_over() and engine.is_match_over()
+
+                        if not done:
+                            next_state = learner.state_key(engine, learner_id)
+                            next_legal = [c.value for c in engine.legal_moves(learner_id)]
+                        else:
+                            next_state = state
+                            next_legal = []
+
+                        learner.update(
+                            state=state,
+                            action_value=action_value,
+                            reward=reward,
+                            next_state=next_state,
+                            next_legal_values=next_legal,
+                            alpha=alpha,
+                            gamma=gamma,
+                            done=done,
+                        )
+
+            # ラウンド終了
+            round_reward = engine.round_scores[learner_id]
+            engine.end_round()
+
+            # 直近状態へラウンド報酬を反映（簡易）
+            if learner.q:
+                # 最新更新状態に薄く加点
+                any_state = next(reversed(learner.q))
+                for a in learner.q[any_state]:
+                    learner.q[any_state][a] += 0.01 * round_reward
+
+        # マッチ終了ボーナス
+        limit = 60 // engine.num_players
+        match_win = engine.players[learner_id].score < limit
+        bonus = 5.0 if match_win else -5.0
+        if learner.q:
+            any_state = next(reversed(learner.q))
+            for a in learner.q[any_state]:
+                learner.q[any_state][a] += 0.01 * bonus
+
+        if ep % 50 == 0:
+            print(f"[train] episode={ep} epsilon={epsilon:.3f} q_states={len(learner.q)}")
+
+    return learner
+
+
+def build_policies_with_learner(
+    num_players: int,
+    learner: QLearningPolicy,
+    learner_id: int = 0,
+    epsilon: float = 0.0,
+):
+    policies = [rule_based_policy for _ in range(num_players)]
+    policies[learner_id] = learner.as_policy(epsilon=epsilon)
+    return policies
+
+
+def evaluate_learner(
+    learner: QLearningPolicy,
+    matches: int = 30,
+    num_players: int = 5,
+    learner_id: int = 0,
+):
+    wins = 0
+    total_score = 0
+    for _ in range(matches):
+        policies = build_policies_with_learner(num_players, learner, learner_id=learner_id, epsilon=0.0)
+        result = run_match(num_players=num_players, policies=policies, verbose=False)
+        limit = 60 // num_players
+        if result.players[learner_id].score < limit:
+            wins += 1
+        total_score += result.players[learner_id].score
+
+    return {
+        "matches": matches,
+        "win_rate": wins / matches if matches else 0.0,
+        "avg_score": total_score / matches if matches else 0.0,
+    }
 
 
 # =========================
@@ -557,36 +819,79 @@ def rule_based_policy(engine, player_id, legal_moves):
 
 
 
-policies = [
-    rule_based_policy,  # Player 0
-    rule_based_policy,          # Player 1
-    rule_based_policy,          # Player 2
-    rule_based_policy,          # Player 3
-    rule_based_policy,          # Player 4
-    rule_based_policy,          # Player 5
-]
-engine = GameEngine(5)
+def run_match(num_players=5, policies=None, verbose=True):
+    if policies is None:
+        policies = [rule_based_policy for _ in range(num_players)]
 
-while not engine.is_match_over():
-    engine.start_new_round()
-    
-    trick_no = 1
+    engine = GameEngine(num_players)
 
-    print(f"\n========== ROUND {engine.round_number} START ==========")
+    while not engine.is_match_over():
+        engine.start_new_round()
+        trick_no = 1
 
-    while not engine.is_round_over():
-        play_trick_verbose(engine, policies, trick_no)
-        trick_no += 1
+        if verbose:
+            print(f"\n========== ROUND {engine.round_number} START ==========")
 
-    engine.end_round()
+        while not engine.is_round_over():
+            if verbose:
+                play_trick_verbose(engine, policies, trick_no)
+            else:
+                winner, _, need_choice = engine.play_trick(policies)
+                if need_choice:
+                    next_leader = choose_leader_rule(engine, winner)
+                    engine.choose_next_leader(winner, next_leader)
+            trick_no += 1
 
-    print("\nRound result:")
-    for i, s in enumerate(engine.round_scores):
-        print(f"Player {i}: +{s} points")
+        engine.end_round()
 
-print("=== MATCH OVER ===")
-limit = 60 // engine.num_players
-for p in engine.players:
-    result = "LOSE" if p.score >= limit else "WIN"
-    print(f"Player {p.id}: score={p.score} → {result}")
+        if verbose:
+            print("\nRound result:")
+            for i, s in enumerate(engine.round_scores):
+                print(f"Player {i}: +{s} points")
 
+    if verbose:
+        print("=== MATCH OVER ===")
+        limit = 60 // engine.num_players
+        for p in engine.players:
+            result = "LOSE" if p.score >= limit else "WIN"
+            print(f"Player {p.id}: score={p.score} → {result}")
+
+    return engine
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Texas Showdown AI utility")
+    parser.add_argument("--mode", choices=["play", "train", "eval"], default="play")
+    parser.add_argument("--players", type=int, default=5)
+    parser.add_argument("--episodes", type=int, default=300)
+    parser.add_argument("--matches", type=int, default=30)
+    parser.add_argument("--learner-id", type=int, default=0)
+    parser.add_argument("--model-path", default="q_policy.json")
+    args = parser.parse_args()
+
+    if args.mode == "play":
+        run_match(num_players=args.players, verbose=True)
+    elif args.mode == "train":
+        learner = train_q_policy(
+            episodes=args.episodes,
+            num_players=args.players,
+            learner_id=args.learner_id,
+        )
+        learner.save(args.model_path)
+        print(f"saved model to: {args.model_path}")
+        stats = evaluate_learner(
+            learner,
+            matches=args.matches,
+            num_players=args.players,
+            learner_id=args.learner_id,
+        )
+        print(f"eval stats: {stats}")
+    else:
+        learner = QLearningPolicy.load(args.model_path)
+        stats = evaluate_learner(
+            learner,
+            matches=args.matches,
+            num_players=args.players,
+            learner_id=args.learner_id,
+        )
+        print(f"eval stats: {stats}")
